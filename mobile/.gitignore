@@ -1,0 +1,17 @@
+# Build outputs
+build/
+build_mac/
+build_apk_stage/
+
+# Packaged app + signing material (never commit keys)
+*.apk
+*.idsig
+*.keystore
+
+# Generated at build time from the exported PMF JSONs (tools/pmf_to_bin.py)
+pmf_tables.bin
+
+# Captured media / bitstreams
+*.mlvb
+*.yuv
+*.i420
