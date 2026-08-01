@@ -498,6 +498,26 @@ void android_main(android_app* app) {
   }
   ACaptureRequest* request = nullptr;
   ACameraDevice_createCaptureRequest(device, TEMPLATE_RECORD, &request);
+  // TEMPLATE_RECORD does not guarantee 3A is enabled, and without it the
+  // sensor keeps default fixed exposure/WB: measured luma averaged 54/255
+  // (range 11-115) in a normally lit room, which reads as a dark, colourless
+  // picture no codec setting can recover.
+  {
+    const uint8_t aeMode = ACAMERA_CONTROL_AE_MODE_ON;
+    ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AE_MODE, 1, &aeMode);
+    const uint8_t awbMode = ACAMERA_CONTROL_AWB_MODE_AUTO;
+    ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AWB_MODE, 1, &awbMode);
+    const uint8_t afMode = ACAMERA_CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+    ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AF_MODE, 1, &afMode);
+    const uint8_t ctrlMode = ACAMERA_CONTROL_MODE_AUTO;
+    ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_MODE, 1, &ctrlMode);
+    // Cap the AE frame-rate range so it cannot buy brightness by dropping to
+    // 10fps in dim light - this is a 30fps live encoder.
+    const int32_t fpsRange[2] = {24, 30};
+    ACaptureRequest_setEntry_i32(request, ACAMERA_CONTROL_AE_TARGET_FPS_RANGE, 2, fpsRange);
+    const uint8_t antiBand = ACAMERA_CONTROL_AE_ANTIBANDING_MODE_50HZ;  // India mains
+    ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AE_ANTIBANDING_MODE, 1, &antiBand);
+  }
   ACameraOutputTarget* target_ = nullptr;
   ACameraOutputTarget_create(readerWin, &target_);
   ACaptureRequest_addTarget(request, target_);
