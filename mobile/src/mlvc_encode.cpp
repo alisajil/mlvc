@@ -42,38 +42,6 @@ struct Sink {
   void u32(uint32_t v) { write(&v, 4); }
 };
 
-// AIMD rate control over q_index. Drops fast when the link is saturated,
-// probes back up slowly. Per-frame q costs nothing in this codec: q_index is
-// just a graph input, so quality changes need no keyframe (unlike H.264).
-struct RateController {
-  int q;
-  int qMin, qMax;
-  int cleanRun = 0;
-  int raiseStep = 2;                      // escalates 2->4->8 while healthy
-  static constexpr int kRaiseAfter = 10;  // clean frames before probing up
-  static constexpr int kRaiseMax = 8;
-
-  // Drop proportional to how starved the receiver actually was: barely late
-  // sheds a little, deeply stalled sheds hard. Fixed-size drops either
-  // overshoot mild congestion or under-react to real stalls.
-  void congested(uint32_t waitMs) {
-    const int step = std::clamp(static_cast<int>(waitMs / 15), 4, 16);
-    q = std::max(qMin, q - step);
-    cleanRun = 0;
-    raiseStep = 2;
-  }
-  // Compounding probe: quality recovery after an outage was the soak's
-  // weakest point (85s floor->max at a fixed +2/10-frame pace).
-  void healthy() {
-    if (++cleanRun >= kRaiseAfter) {
-      q = std::min(qMax, q + raiseStep);
-      raiseStep = std::min(kRaiseMax, raiseStep * 2);
-      cleanRun = 0;
-    }
-  }
-  void hold() { cleanRun = 0; }
-};
-
 // Pins the calling thread to the big cores (4-7 on SM8650-class parts) so the
 // scheduler cannot park hot loops on LITTLE cores while the NPU runs.
 void pinBigCores() {
@@ -217,7 +185,8 @@ int main(int argc, char** argv) {
   out.u32(static_cast<uint32_t>(qIndex));
   out.u32(liveInput ? 0u : static_cast<uint32_t>(frames));
 
-  RateController rc{qIndex, qMin, qMax};
+  mlvc::RateController rc;
+  rc.q = qIndex; rc.qMin = qMin; rc.qMax = qMax;
   int qFloorSeen = qIndex, qCeilSeen = qIndex, adaptations = 0;
 
   std::vector<uint8_t> frameBuf(frameBytes);
@@ -278,7 +247,7 @@ int main(int argc, char** argv) {
       }
       if (got) {
         const int before = rc.q;
-        if (latest.verdict < 0) rc.congested(latest.waitMs);
+        if (latest.verdict < 0) rc.maybeCongested(latest.waitMs);
         else if (latest.verdict > 0) rc.healthy();
         else rc.hold();
         if (rc.q != before) {
@@ -386,6 +355,7 @@ int main(int argc, char** argv) {
     out2[0] = xHat.data();
 
     ++curIdx;
+    rc.tick();
     tPre.add(t1 - t0); tNpu1.add(t2 - t1); tNpu2.add(t3 - t2);
     tRans.add(t4 - t3); tTotal.add(t4 - t0);
   }

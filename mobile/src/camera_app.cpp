@@ -48,27 +48,6 @@ double msNow() {
       .count();
 }
 
-// Same AIMD controller as mlvc_encode.cpp (kept local: the CLI and the app
-// are separate binaries and this is 25 lines).
-struct RateController {
-  int q, qMin, qMax;
-  int cleanRun = 0, raiseStep = 2;
-  static constexpr int kRaiseAfter = 10, kRaiseMax = 8;
-  void congested(uint32_t waitMs) {
-    q = std::max(qMin, q - std::clamp(static_cast<int>(waitMs / 15), 4, 16));
-    cleanRun = 0;
-    raiseStep = 2;
-  }
-  void healthy() {
-    if (++cleanRun >= kRaiseAfter) {
-      q = std::min(qMax, q + raiseStep);
-      raiseStep = std::min(kRaiseMax, raiseStep * 2);
-      cleanRun = 0;
-    }
-  }
-  void hold() { cleanRun = 0; }
-};
-
 // Latest-frame slot: capture thread deposits, encode thread takes. Newest
 // wins — a live encoder must drop stale camera frames, never queue them.
 struct FrameSlot {
@@ -316,7 +295,8 @@ void encodeLoop(android_app* app, const std::string& target, int q0, int qMin, i
   wrU32(static_cast<uint32_t>(q0));
   wrU32(0);  // frames=0: live stream, until socket closes
 
-  RateController rc{q0, qMin, qMax};
+  mlvc::RateController rc;
+  rc.q = q0; rc.qMin = qMin; rc.qMax = qMax;
   mlvc::CoderWorkspace ws;
   ws.enc.reserve(zN + 2 * yHalfN);
   int f = 0;
@@ -336,7 +316,7 @@ void encodeLoop(android_app* app, const std::string& target, int q0, int qMin, i
       if (fb.magic == mlvc::kFeedbackMagic) { latest = fb; got = true; }
     }
     if (got) {
-      if (latest.verdict < 0) rc.congested(latest.waitMs);
+      if (latest.verdict < 0) rc.maybeCongested(latest.waitMs);
       else if (latest.verdict > 0) rc.healthy();
       else rc.hold();
     }
@@ -371,6 +351,7 @@ void encodeLoop(android_app* app, const std::string& target, int q0, int qMin, i
     }
     const double sendMs = msNow() - tSend0;
     if (sendMs > 33.0) rc.congested(static_cast<uint32_t>(sendMs));
+    rc.tick();
 
     refFeature.swap(feature);
     refFrame.swap(xHat);
