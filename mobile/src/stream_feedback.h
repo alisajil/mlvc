@@ -24,6 +24,7 @@ struct Feedback {
   uint32_t frameIdx = 0;
   int32_t verdict = 0;   // -1 shed bitrate, 0 hold, +1 headroom to probe up
   uint32_t waitMs = 0;   // how long the receiver sat idle waiting for this frame
+  uint32_t needIframe = 0;  // a frame arrived incomplete: re-seed both chains
 };
 #pragma pack(pop)
 

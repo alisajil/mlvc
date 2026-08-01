@@ -25,6 +25,7 @@
 
 #include "mlvc_codec.h"
 #include "net_util.h"
+#include "srt_transport.h"
 #include "qnn_runner.h"
 #include "stream_feedback.h"
 
@@ -32,14 +33,28 @@ namespace {
 
 // Writes the .mlvb byte stream to a file, a socket, or both.
 struct Sink {
+  SRTSOCKET srt = SRT_INVALID_SOCK;
+  uint32_t srtFrameIdx = 0;
+  std::vector<uint8_t> srtBuf;   // one frame accumulated, then sent chunked
   std::ofstream file;
   int fd = -1;
   bool ok = true;
   void write(const void* data, size_t n) {
     if (file.is_open()) file.write(static_cast<const char*>(data), static_cast<std::streamsize>(n));
+    if (srt != SRT_INVALID_SOCK) {  // message transport: buffer, send per frame
+      const auto* p = static_cast<const uint8_t*>(data);
+      srtBuf.insert(srtBuf.end(), p, p + n);
+      return;
+    }
     if (fd >= 0 && !mlvc::sendAll(fd, data, n)) ok = false;
   }
   void u32(uint32_t v) { write(&v, 4); }
+  // SRT is message-oriented: flush the accumulated frame as chunks.
+  void flushFrame() {
+    if (srt == SRT_INVALID_SOCK || srtBuf.empty()) return;
+    if (!mlvc::srtSendFrame(srt, srtFrameIdx++, srtBuf.data(), srtBuf.size())) ok = false;
+    srtBuf.clear();
+  }
 };
 
 // Pins the calling thread to the big cores (4-7 on SM8650-class parts) so the
@@ -69,6 +84,8 @@ struct Stats {
 int main(int argc, char** argv) {
   pinBigCores();
   std::string yuvPath, enc1Path, enc2Path, pmfPath, outPath, streamTarget;
+  bool useSrt = false;
+  int srtLatencyMs = 200;
   int yuvListenPort = 0;  // live camera bridge: raw I420 frames over localhost
   std::string backend = "libQnnHtp.so", system = "libQnnSystem.so";
   int width = 1280, height = 720, frames = 0, qIndex = 63;
@@ -79,6 +96,8 @@ int main(int argc, char** argv) {
     auto next = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : ""; };
     if (a == "--yuv") yuvPath = next();
     else if (a == "--yuv-listen") yuvListenPort = atoi(next());
+    else if (a == "--srt") useSrt = true;
+    else if (a == "--srt-latency") srtLatencyMs = atoi(next());
     else if (a == "--width") width = atoi(next());
     else if (a == "--height") height = atoi(next());
     else if (a == "--frames") frames = atoi(next());
@@ -172,8 +191,28 @@ int main(int argc, char** argv) {
               streamTarget.c_str());
       return 1;
     }
+    if (useSrt) {
+      mlvc::srtStartup();
+      if (getenv("MLVC_SRT_DEBUG")) {
+        srt_setloglevel(LOG_DEBUG);
+        srt_setlogflags(0);
+        static auto handler = [](void*, int level, const char* file, int line,
+                                 const char* area, const char* msg) {
+          fprintf(stderr, "[srt %d] %s:%d %s: %s\n", level, file, line, area, msg);
+        };
+        srt_setloghandler(nullptr, +handler);
+      }
+      out.srt = mlvc::srtConnect(host, port, srtLatencyMs);
+      out.fd = -1;
+      if (out.srt == SRT_INVALID_SOCK) {
+        fprintf(stderr, "srt connect to %s failed\n", streamTarget.c_str());
+        return 1;
+      }
+      printf("streaming to %s over SRT (latency budget %d ms)\n",
+             streamTarget.c_str(), srtLatencyMs);
+    } else
     out.fd = mlvc::tcpConnect(host, port);
-    if (out.fd < 0) {
+    if (!useSrt && out.fd < 0) {
       fprintf(stderr, "connect to %s failed (receiver listening? router IPv6 "
                       "firewall may block inbound port %u)\n", streamTarget.c_str(), port);
       return 1;
@@ -187,7 +226,7 @@ int main(int argc, char** argv) {
 
   mlvc::RateController rc;
   rc.q = qIndex; rc.qMin = qMin; rc.qMax = qMax;
-  int qFloorSeen = qIndex, qCeilSeen = qIndex, adaptations = 0;
+  int qFloorSeen = qIndex, qCeilSeen = qIndex, adaptations = 0, iframesForced = 0;
 
   std::vector<uint8_t> frameBuf(frameBytes);
   mlvc::CoderWorkspace ws;
@@ -258,8 +297,22 @@ int main(int argc, char** argv) {
     if (adaptive && out.fd >= 0) {
       mlvc::Feedback fb{}, latest{};
       bool got = false;
-      while (mlvc::recvNonBlocking(out.fd, &fb, sizeof(fb))) {
-        if (fb.magic == mlvc::kFeedbackMagic) { latest = fb; got = true; }
+      if (out.srt != SRT_INVALID_SOCK) {
+        char fbuf[sizeof(mlvc::Feedback)];
+        while (srt_recv(out.srt, fbuf, sizeof(fbuf)) == (int)sizeof(fbuf)) {
+          memcpy(&fb, fbuf, sizeof(fb));
+          if (fb.magic == mlvc::kFeedbackMagic) { latest = fb; got = true; }
+        }
+      } else {
+        while (mlvc::recvNonBlocking(out.fd, &fb, sizeof(fb))) {
+          if (fb.magic == mlvc::kFeedbackMagic) { latest = fb; got = true; }
+        }
+      }
+      if (got && latest.needIframe) {
+        // The receiver could not decode a frame. Both reference chains must be
+        // re-seeded or every later frame inherits the damage.
+        curIdx = 0;
+        ++iframesForced;
       }
       if (got) {
         const int before = rc.q;
@@ -359,6 +412,7 @@ int main(int argc, char** argv) {
     out.write(&tsMs, sizeof(tsMs));
     out.write(payload.data(), payload.size());
     if (!out.ok) { fprintf(stderr, "receiver disconnected at frame %d\n", f); return 1; }
+    out.flushFrame();
     const double sendMs = msNow() - tSend0;
     tSendStat.add(sendMs);
     // send() blocking means the socket buffer is full: local congestion signal
@@ -404,6 +458,11 @@ int main(int argc, char** argv) {
          "ransWait=%.2f(%.2f) total=%.2f(%.2f)\n",
          tPre.avg(), tPre.mx, tNpu1.avg(), tNpu1.mx, tNpu2.avg(), tNpu2.mx,
          tRans.avg(), tRans.mx, tTotal.avg(), tTotal.mx);
+  if (out.srt != SRT_INVALID_SOCK) {
+    srt_close(out.srt);
+    mlvc::srtCleanup();
+    printf("srt closed\n");
+  }
   if (out.fd >= 0) {
     // Half-close and wait for the receiver to finish reading everything still
     // queued in the socket buffer; exiting immediately resets the connection
@@ -415,6 +474,7 @@ int main(int argc, char** argv) {
     printf("socket drained, receiver closed\n");
   }
   printf("send blocking: avg=%.2f ms max=%.2f ms\n", tSendStat.avg(), tSendStat.mx);
+  if (iframesForced) printf("recovery: %d I-frames forced by receiver\n", iframesForced);
   if (liveInput) {
     printf("latency guard: %ld input frames skipped (stale), %ld encodes skipped "
            "(link backlogged)\n", inputDropped, encodeSkipped);

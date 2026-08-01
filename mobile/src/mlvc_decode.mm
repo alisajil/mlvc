@@ -22,16 +22,36 @@
 
 #include "mlvc_codec.h"
 #include "net_util.h"
+#include "srt_transport.h"
 #include "stream_feedback.h"
 
 namespace {
 
 // Reads the .mlvb byte stream from a file or a live socket.
 struct Source {
+  SRTSOCKET srt = SRT_INVALID_SOCK;
+  std::vector<uint8_t> msg;   // current reassembled frame
+  size_t msgPos = 0;
+  bool frameLost = false;     // set when SRT abandoned chunks of a frame
   std::ifstream file;
   int fd = -1;
   bool ok = true;
   bool read(void* data, size_t n) {
+    if (srt != SRT_INVALID_SOCK) {
+      while (msgPos + n > msg.size()) {   // need the next message
+        uint32_t idx = 0;
+        bool lost = false;
+        std::vector<uint8_t> next;
+        if (!mlvc::srtRecvFrame(srt, next, idx, lost)) return ok = false;
+        if (lost) frameLost = true;
+        if (next.empty()) continue;       // gap report, no payload
+        msg = std::move(next);
+        msgPos = 0;
+      }
+      memcpy(data, msg.data() + msgPos, n);
+      msgPos += n;
+      return ok = true;
+    }
     if (fd >= 0) return ok = mlvc::recvAll(fd, data, n);
     file.read(static_cast<char*>(data), static_cast<std::streamsize>(n));
     return ok = static_cast<bool>(file);
@@ -75,6 +95,8 @@ int main(int argc, char** argv) {
   bool computeAll = false;
   bool bindAll = false;
   bool verbose = false;
+  bool useSrt = false;
+  int srtLatencyMs = 200;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -87,6 +109,8 @@ int main(int argc, char** argv) {
     else if (a == "--compute-all") computeAll = true;
     else if (a == "--public") bindAll = true;
     else if (a == "--verbose") verbose = true;
+    else if (a == "--srt") useSrt = true;
+    else if (a == "--srt-latency") srtLatencyMs = atoi(next());
     else { fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
   }
   if ((bsPath.empty() && listenPort == 0) || modelPath.empty() || pmfPath.empty()) {
@@ -99,8 +123,16 @@ int main(int argc, char** argv) {
   if (listenPort > 0) {
     printf("listening on %s:%d ...\n", bindAll ? "0.0.0.0" : "127.0.0.1", listenPort);
     fflush(stdout);
-    bs.fd = mlvc::tcpAcceptOne((uint16_t)listenPort, bindAll);
-    if (bs.fd < 0) { fprintf(stderr, "listen failed\n"); return 1; }
+    if (useSrt) {
+      mlvc::srtStartup();
+      printf("SRT listening on :%d (latency budget %d ms)\n", listenPort, srtLatencyMs);
+      fflush(stdout);
+      bs.srt = mlvc::srtAcceptOne((uint16_t)listenPort, srtLatencyMs);
+      if (bs.srt == SRT_INVALID_SOCK) { fprintf(stderr, "srt listen failed\n"); return 1; }
+    } else {
+      bs.fd = mlvc::tcpAcceptOne((uint16_t)listenPort, bindAll);
+      if (bs.fd < 0) { fprintf(stderr, "listen failed\n"); return 1; }
+    }
     printf("sender connected\n");
   } else {
     bs.file.open(bsPath, std::ios::binary);
@@ -213,6 +245,7 @@ int main(int argc, char** argv) {
   double sumWait = 0, sumGap = 0, maxGap = 0, lastArrival = 0;
   int starvedFrames = 0, qMinSeen = 999, qMaxSeen = -1;
   double minDelta = 1e18, maxDelta = -1e18, sumDelta = 0;
+  int lostFrames = 0;
   long qSum = 0;
   double psnrMin = 1e9;
   std::vector<uint8_t> payload;
@@ -254,7 +287,7 @@ int main(int argc, char** argv) {
       if (gap > maxGap) maxGap = gap;
     }
     lastArrival = t0;
-    if (bs.fd >= 0) {
+    if (bs.fd >= 0 || bs.srt != SRT_INVALID_SOCK) {
       // Receiver starvation is the congestion signal: a healthy link leaves
       // this near zero, a saturated one leaves the decoder waiting.
       const double waitMs = t0 - tWait0;
@@ -262,7 +295,9 @@ int main(int argc, char** argv) {
       fb.frameIdx = (uint32_t)f;
       fb.waitMs = (uint32_t)waitMs;
       fb.verdict = waitMs > mlvc::kStarvedMs ? -1 : (waitMs < mlvc::kHealthyMs ? 1 : 0);
-      mlvc::sendNonBlocking(bs.fd, &fb, sizeof(fb));
+      if (bs.frameLost) { fb.needIframe = 1; bs.frameLost = false; ++lostFrames; }
+      if (bs.srt != SRT_INVALID_SOCK) srt_send(bs.srt, (const char*)&fb, sizeof(fb));
+      else mlvc::sendNonBlocking(bs.fd, &fb, sizeof(fb));
       if (fb.verdict < 0) ++starvedFrames;
       qSum += qFrame;
       if (qFrame < qMinSeen) qMinSeen = qFrame;
@@ -382,6 +417,7 @@ int main(int argc, char** argv) {
              "(clock offset removed)\n",
              sumDelta / statFrames - minDelta, maxDelta - minDelta);
     }
+    if (lostFrames) printf("loss: %d frames incomplete, I-frame recovery requested\n", lostFrames);
     printf("adaptive: q ranged %d..%d (mean %.1f) | %d/%d frames starved\n",
            qMinSeen, qMaxSeen, (double)qSum / statFrames, starvedFrames, decoded);
   }

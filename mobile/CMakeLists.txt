@@ -19,7 +19,12 @@ add_executable(mlvc_encode
   src/qnn_runner.cpp
   src/mlvc_codec.cpp
   src/rans.cpp
+  src/srt_transport.cpp
 )
+# libsrt cross-compiled for arm64-android (see PLAN.md for the build recipe)
+set(SRT_ANDROID "$ENV{HOME}/mlvc/srt/android-install")
+target_include_directories(mlvc_encode PRIVATE ${SRT_ANDROID}/include)
+target_link_libraries(mlvc_encode ${SRT_ANDROID}/lib/libsrt.a)
 
 foreach(tgt mlvc_bench mlvc_encode)
   target_include_directories(${tgt} PRIVATE ${QAIRT_INCLUDE})
