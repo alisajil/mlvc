@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
   auto rdU32 = [&]() { return bs.u32(); };
   if (rdU32() != 0x424C564Du) { fprintf(stderr, "bad magic\n"); return 1; }
   const uint32_t version = rdU32();
-  if (version != 1 && version != 2) {
+  if (version != 1 && version != 2 && version != 3) {
     fprintf(stderr, "unsupported container version %u\n", version);
     return 1;
   }
@@ -212,6 +212,7 @@ int main(int argc, char** argv) {
   double sumRans = 0, sumNpu = 0, sumPsnr = 0;
   double sumWait = 0, sumGap = 0, maxGap = 0, lastArrival = 0;
   int starvedFrames = 0, qMinSeen = 999, qMaxSeen = -1;
+  double minDelta = 1e18, maxDelta = -1e18, sumDelta = 0;
   long qSum = 0;
   double psnrMin = 1e9;
   std::vector<uint8_t> payload;
@@ -235,8 +236,16 @@ int main(int argc, char** argv) {
         return 1;
       }
     }
+    uint64_t sendTsMs = 0;
+    if (version >= 3) bs.read(&sendTsMs, sizeof(sendTsMs));
     payload.resize(sz);
     if (!bs.read(payload.data(), sz)) { fprintf(stderr, "truncated at frame %d\n", f); return 1; }
+    if (version >= 3) {
+      const double delta = msNow() - (double)sendTsMs;  // unsynced clocks: use spread
+      if (delta < minDelta) minDelta = delta;
+      if (delta > maxDelta) maxDelta = delta;
+      sumDelta += delta;
+    }
     const double t0 = msNow();
     sumWait += t0 - tWait0;
     if (f > 0) {
@@ -368,6 +377,11 @@ int main(int argc, char** argv) {
            "(%.1f fps sustained)\n",
            sumWait / statFrames, sumGap / std::max(1, statFrames - 1), maxGap,
            1000.0 / (sumGap / std::max(1, statFrames - 1)));
+    if (version >= 3 && decoded > 0) {
+      printf("latency: queueing delay above best case: avg=%.0f ms peak=%.0f ms "
+             "(clock offset removed)\n",
+             sumDelta / statFrames - minDelta, maxDelta - minDelta);
+    }
     printf("adaptive: q ranged %d..%d (mean %.1f) | %d/%d frames starved\n",
            qMinSeen, qMaxSeen, (double)qSum / statFrames, starvedFrames, decoded);
   }

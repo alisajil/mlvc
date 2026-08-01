@@ -180,7 +180,7 @@ int main(int argc, char** argv) {
     }
     printf("streaming to %s\n", streamTarget.c_str());
   }
-  out.u32(0x424C564Du); out.u32(2);  // v2: per-frame q_index
+  out.u32(0x424C564Du); out.u32(3);  // v3: per-frame q_index + send timestamp
   out.u32(static_cast<uint32_t>(width)); out.u32(static_cast<uint32_t>(height));
   out.u32(static_cast<uint32_t>(qIndex));
   out.u32(liveInput ? 0u : static_cast<uint32_t>(frames));
@@ -219,8 +219,19 @@ int main(int argc, char** argv) {
   // Frame 0 preprocessed up front; frame f+1 is read+converted on a worker
   // thread while frame f runs on the NPU.
   std::vector<uint16_t> xNext(hw * 3);
+  long inputDropped = 0;   // camera frames skipped to stay current
+  long encodeSkipped = 0;  // frames not encoded because the link was backlogged
   auto readFrameWrapped = [&]() -> bool {
-    if (bridgeFd >= 0) return mlvc::recvAll(bridgeFd, frameBuf.data(), frameBytes);
+    if (bridgeFd >= 0) {
+      if (!mlvc::recvAll(bridgeFd, frameBuf.data(), frameBytes)) return false;
+      // Newest-wins on input: whole frames already queued behind this one mean
+      // the encoder fell behind the camera, so skip to the freshest.
+      while (mlvc::bytesAvailable(bridgeFd) >= static_cast<int>(frameBytes)) {
+        if (!mlvc::recvAll(bridgeFd, frameBuf.data(), frameBytes)) return false;
+        ++inputDropped;
+      }
+      return true;
+    }
     yuv.read(reinterpret_cast<char*>(frameBuf.data()),
              static_cast<std::streamsize>(frameBytes));
     if (yuv) return true;
@@ -234,6 +245,11 @@ int main(int argc, char** argv) {
   if (!readFrameWrapped()) { fprintf(stderr, "yuv read failed at frame 0\n"); return 1; }
   mlvc::yuv420ToTensor(frameBuf.data(), width, height, x.data());
 
+  // ~0.35s of video at the 1.3Mbps this link sustains. Large enough that TCP
+  // keeps enough in flight for throughput, small enough that a stall is felt
+  // within a few frames instead of accumulating seconds.
+  // MLVC_NOGUARD=1 disables the latency guard, for A/B measurement only.
+  const int kBacklogLimitBytes = getenv("MLVC_NOGUARD") ? (1 << 30) : 64 * 1024;
   bool liveEnded = false;
   int curIdx = 0;  // resets at every I-frame; drives qpShift and the schedule
   for (int f = 0; (liveInput ? !liveEnded : f < frames); ++f) {
@@ -259,6 +275,20 @@ int main(int argc, char** argv) {
     }
     // Debug: force a deterministic q swing to test per-frame quality changes
     // without any network in the loop.
+    // Bound end-to-end latency. Dropping an INPUT frame is safe: the encoder
+    // simply never codes it, so both ends stay on the same reference chain and
+    // the stream just runs at a lower frame rate for a moment. Dropping an
+    // ENCODED frame would be fatal - the decoder's reference would diverge.
+    const bool backlogged =
+        liveInput && out.fd >= 0 && mlvc::socketBacklog(out.fd) > kBacklogLimitBytes;
+    if (backlogged) {
+      ++encodeSkipped;
+      if (!readFrameWrapped()) break;
+      mlvc::yuv420ToTensor(frameBuf.data(), width, height, x.data());
+      --f;  // this camera frame was never coded, so it consumes no frame index
+      continue;
+    }
+
     // Reference refresh, identical schedule on the decoder. curIdx restarts at
     // each I-frame, exactly as cur_frame_idx does in the Python frame loop.
     if (mlvc::isIframe(curIdx)) {
@@ -322,6 +352,11 @@ int main(int argc, char** argv) {
     const double tSend0 = msNow();
     out.u32(static_cast<uint32_t>(payload.size()));
     out.u32(static_cast<uint32_t>(qFrame));
+    // Sender clock. The two machines are not synchronised, so only the SPREAD
+    // of (arrival - send) is meaningful - that spread is exactly the queueing
+    // delay this guard exists to bound.
+    const uint64_t tsMs = static_cast<uint64_t>(msNow());
+    out.write(&tsMs, sizeof(tsMs));
     out.write(payload.data(), payload.size());
     if (!out.ok) { fprintf(stderr, "receiver disconnected at frame %d\n", f); return 1; }
     const double sendMs = msNow() - tSend0;
@@ -380,6 +415,10 @@ int main(int argc, char** argv) {
     printf("socket drained, receiver closed\n");
   }
   printf("send blocking: avg=%.2f ms max=%.2f ms\n", tSendStat.avg(), tSendStat.mx);
+  if (liveInput) {
+    printf("latency guard: %ld input frames skipped (stale), %ld encodes skipped "
+           "(link backlogged)\n", inputDropped, encodeSkipped);
+  }
   if (adaptive) {
     printf("adaptive: %d q changes, q ranged %d..%d (started %d, ended %d)\n",
            adaptations, qFloorSeen, qCeilSeen, qIndex, rc.q);

@@ -6,6 +6,7 @@
 // ponytail: TCP + blocking IO. UDP/FEC/jitter buffer belongs here when the
 // transport needs to survive real packet loss.
 
+#include <sys/ioctl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -101,6 +102,31 @@ inline int tcpAcceptOne(uint16_t port, bool bindAll = false) {
   close(srv);
   if (fd >= 0) setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
   return fd;
+}
+
+// Bytes handed to the kernel but not yet acknowledged by the peer. This is the
+// real latency backlog: TCP will happily buffer megabytes, which on a stalled
+// link means the receiver is shown video that is many seconds old.
+inline int socketBacklog(int fd) {
+#ifdef TIOCOUTQ
+  int n = 0;
+  return ioctl(fd, TIOCOUTQ, &n) == 0 ? n : 0;
+#else
+  (void)fd;
+  return 0;
+#endif
+}
+
+// Whole datagrams/frames already readable, used to skip to the freshest input.
+inline int bytesAvailable(int fd) {
+  int n = 0;
+  return ioctl(fd, FIONREAD, &n) == 0 ? n : 0;
+}
+
+// Caps how much the kernel will hoard, so socketBacklog() stays meaningful and
+// a stall cannot silently accumulate seconds of video.
+inline void capSendBuffer(int fd, int bytes) {
+  setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
 }
 
 inline bool sendAll(int fd, const void* data, size_t n) {
