@@ -76,7 +76,9 @@ fi
 echo "model: $MODEL"
 
 DEC_LOG="$HERE/live_dec.log"
-bash -c "'$HERE/build_mac/mlvc_decode' --listen $SRT_PORT --public --srt --bind $MAC_ADDR \
+DEC_QLOG_EXPORT=""
+[ "${QLOG:-0}" = "1" ] && DEC_QLOG_EXPORT="MLVC_QLOG=1"
+bash -c "$DEC_QLOG_EXPORT '$HERE/build_mac/mlvc_decode' --listen $SRT_PORT --public --srt --bind $MAC_ADDR \
   --model '$MAC_MODEL' \
   --pmf '$MAC_PMF' --out /dev/stdout 2>'$DEC_LOG' \
   | ffplay -f rawvideo -pixel_format yuv420p -video_size 1280x720 -framerate 30 -" &
@@ -84,7 +86,24 @@ DEC_PID=$!
 sleep 1
 echo "decoder: $(tail -2 "$DEC_LOG" 2>/dev/null)"
 
-adb_ shell "cd /data/local/tmp/mlvc && export LD_LIBRARY_PATH=/data/local/tmp/mlvc ADSP_LIBRARY_PATH=/data/local/tmp/mlvc && nohup ./mlvc_encode --yuv-listen 8901 --width 1280 --height 720 --frames 0 --q 63 --enc1 $PHONE_ENC1 --enc2 $PHONE_ENC2 --pmf $PHONE_PMF --srt --stream '[$MAC_ADDR]:$SRT_PORT' > /data/local/tmp/mlvc/enc_live.log 2>&1 & disown" >/dev/null 2>&1 &
+# ADAPTIVE=1 turns on the AIMD rate controller (--adaptive --q-min --q-max).
+# The encoder-side plumbing runs over any transport, but the congestion
+# signal it listens for (receiver wait-time) is shaped around TCP - SRT's
+# TLPKTDROP turns congestion into an instant frame-skip rather than growing
+# wait time, so it may never fire here in practice. See PLAN.md.
+ADAPTIVE_ARGS=""
+if [ "${ADAPTIVE:-0}" = "1" ]; then
+  ADAPTIVE_ARGS="--adaptive --q-min ${Q_MIN:-21} --q-max ${Q_MAX:-63}"
+  echo "adaptive rate control: on (q-min=${Q_MIN:-21} q-max=${Q_MAX:-63})"
+fi
+
+# getenv() only checks the pointer is non-null, so an *exported-but-empty*
+# MLVC_QLOG would still count as "set" and force logging on by default -
+# only export it at all when actually requested.
+QLOG_EXPORT=""
+[ "${QLOG:-0}" = "1" ] && QLOG_EXPORT="MLVC_QLOG=1"
+
+adb_ shell "cd /data/local/tmp/mlvc && export LD_LIBRARY_PATH=/data/local/tmp/mlvc ADSP_LIBRARY_PATH=/data/local/tmp/mlvc $QLOG_EXPORT && nohup ./mlvc_encode --yuv-listen 8901 --width 1280 --height 720 --frames 0 --q 63 $ADAPTIVE_ARGS --enc1 $PHONE_ENC1 --enc2 $PHONE_ENC2 --pmf $PHONE_PMF --srt --stream '[$MAC_ADDR]:$SRT_PORT' > /data/local/tmp/mlvc/enc_live.log 2>&1 & disown" >/dev/null 2>&1 &
 sleep 2
 adb_ shell am start -n com.mlvc.cam/android.app.NativeActivity -e mode bridge -e camera front -e bridge_port 8901 >/dev/null
 
