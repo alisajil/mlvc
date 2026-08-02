@@ -28,7 +28,7 @@ target_link_libraries(mlvc_encode ${SRT_ANDROID}/lib/libsrt.a)
 
 foreach(tgt mlvc_bench mlvc_encode)
   target_include_directories(${tgt} PRIVATE ${QAIRT_INCLUDE})
-  target_link_libraries(${tgt} dl)
+  target_link_libraries(${tgt} dl log)  # log: qnn_runner routes QNN logs to logcat too
   target_compile_options(${tgt} PRIVATE -O2 -Wall)
 endforeach()
 

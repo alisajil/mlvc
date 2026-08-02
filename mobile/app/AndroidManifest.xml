@@ -12,6 +12,12 @@
 
   <application android:label="MLVC Cam" android:hasCode="false"
       android:extractNativeLibs="true">
+    <!-- fastrpc client for the Hexagon NPU. A vendor public library (listed in
+         /vendor/etc/public.libraries.txt), but since API 31 an app must opt in
+         explicitly or the QNN stub's dlopen fails with "libcdsprpc.so not
+         found in namespace clns-N" - which is the real reason in-app QNN
+         failed here, NOT an SELinux/sandbox block as first assumed. -->
+    <uses-native-library android:name="libcdsprpc.so" android:required="false" />
     <activity android:name="android.app.NativeActivity"
         android:exported="true"
         android:screenOrientation="landscape"

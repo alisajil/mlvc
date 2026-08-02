@@ -144,8 +144,12 @@ void image888ToI420(AImage* img, uint8_t* out) {
   }
 }
 
-// Bridge mode: no QNN in-app (blocked by the app sandbox) — forward raw I420
-// frames over localhost TCP to the shell-domain CLI, which owns the NPU.
+// Bridge mode: forward raw I420 frames over localhost TCP to the CLI, which
+// owns the NPU and the SRT transport. Historically believed mandatory ("app
+// sandbox blocks QNN") - disproven: the real blocker was libcdsprpc.so not
+// resolving in the app's linker namespace, fixed by the manifest's
+// <uses-native-library> entry. Bridge remains useful because the in-app
+// encode loop below is TCP-only while the CLI speaks SRT.
 void bridgeLoop(uint16_t port, const std::string& dumpPath) {
   bool dumped = false;
   const int fd = mlvc::tcpConnect("127.0.0.1", port);
@@ -407,12 +411,13 @@ void android_main(android_app* app) {
   }
   LOGI("window ready %p", (void*)app->window);
 
-  // fastrpc resolves the DSP skel through this env var at first use.
-  // The skel shipped in the QAIRT SDK's hexagon-v75/unsigned/ folder is only
-  // trusted by the DSP loader from allow-listed paths (e.g. /data/local/tmp
-  // on this device) on a retail build, NOT from an app's private native-lib
-  // dir — shipping this for real needs Qualcomm's signed skel or a testsig.
-  // ponytail: hardcoded dev path, replace with signed skel before any real release.
+  // fastrpc resolves the DSP skel through this env var at first use. The
+  // unsigned skel packaged in our APK's native-lib dir DOES load on this
+  // retail S24U (unsigned-PD offload is permitted for apps here) - the
+  // earlier in-app failure was never the skel path or SELinux at all, but
+  // libcdsprpc.so failing to resolve in the app's classloader namespace
+  // (fixed via <uses-native-library> in the manifest; the lib is on
+  // /vendor/etc/public.libraries.txt, apps just must opt in since API 31).
   const std::string adspOverride = intentExtra(app, env, "adsp_path");
   setenv("ADSP_LIBRARY_PATH",
          adspOverride.empty() ? nativeLibDir(app, env).c_str() : adspOverride.c_str(), 1);

@@ -12,6 +12,26 @@
 #include "HTP/QnnHtpDevice.h"
 #include "HTP/QnnHtpPerfInfrastructure.h"
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
+namespace {
+// Routes QNN's internal log to somewhere actually visible: logcat in an app
+// process (stderr goes nowhere there), stderr for the CLI. Without this the
+// DSP-side load errors (skel path, unsigned-PD rejection, blob version) are
+// silently dropped - which is how the in-app failure stayed undiagnosed.
+void qnnLogCallback(const char* fmt, QnnLog_Level_t level, uint64_t /*ts*/, va_list args) {
+  char buf[1024];
+  vsnprintf(buf, sizeof(buf), fmt, args);
+#ifdef __ANDROID__
+  __android_log_print(level <= QNN_LOG_LEVEL_ERROR ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO,
+                      "QnnLog", "%s", buf);
+#endif
+  fprintf(stderr, "[QnnLog %d] %s\n", static_cast<int>(level), buf);
+}
+}  // namespace
+
 namespace mlvc {
 namespace {
 
@@ -155,10 +175,11 @@ bool QnnRunner::init(const std::string& backendPath, const std::string& systemPa
 
   // --- backend + device ---
   if (impl_->fn.logCreate) {
-    impl_->fn.logCreate(nullptr, QNN_LOG_LEVEL_ERROR, &impl_->log);
+    impl_->fn.logCreate(qnnLogCallback, QNN_LOG_LEVEL_DEBUG, &impl_->log);
   }
-  if (impl_->fn.backendCreate(impl_->log, nullptr, &impl_->backend) != QNN_SUCCESS) {
-    FAILF("backendCreate failed");
+  {
+    const Qnn_ErrorHandle_t err = impl_->fn.backendCreate(impl_->log, nullptr, &impl_->backend);
+    if (err != QNN_SUCCESS) FAILF("backendCreate failed: 0x%llx", (unsigned long long)err);
   }
   // HTP accepts a default device; failure here is fatal only if contextCreate
   // later also fails, so try with device first and retry with null.
@@ -333,10 +354,12 @@ bool QnnRunner::init(const std::string& backendPath, const std::string& systemPa
     }
   }
 
-  if (impl_->fn.contextCreateFromBinary(
-          impl_->backend, impl_->device, nullptr, bin.data(), bin.size(),
-          &impl_->context, nullptr) != QNN_SUCCESS) {
-    FAILF("contextCreateFromBinary failed");
+  {
+    const Qnn_ErrorHandle_t err = impl_->fn.contextCreateFromBinary(
+        impl_->backend, impl_->device, nullptr, bin.data(), bin.size(),
+        &impl_->context, nullptr);
+    if (err != QNN_SUCCESS)
+      FAILF("contextCreateFromBinary failed: 0x%llx", (unsigned long long)err);
   }
 
   for (const auto& g : graphIo_) {
