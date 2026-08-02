@@ -32,3 +32,5 @@ venv/
 .venv/
 .Ds_Store
 .env
+/mobile/*.log
+/video/conversion/_full_model/model_configs.yaml
