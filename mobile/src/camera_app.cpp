@@ -33,6 +33,7 @@
 #include "mlvc_codec.h"
 #include "net_util.h"
 #include "qnn_runner.h"
+#include "srt_transport.h"
 #include "stream_feedback.h"
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "MLVC", __VA_ARGS__)
@@ -236,7 +237,8 @@ std::string materializeAsset(android_app* app, const char* name) {
 
 void encodeLoop(android_app* app, const std::string& target, int q0, int qMin, int qMax,
                 const std::string& enc1Path, const std::string& enc2Path,
-                const std::string& pmfPath, const std::string& backendLib) {
+                const std::string& pmfPath, const std::string& backendLib,
+                bool useSrt, int srtLatencyMs) {
   cpu_set_t mask;
   CPU_ZERO(&mask);
   for (int c = 4; c < 8; ++c) CPU_SET(c, &mask);
@@ -265,9 +267,18 @@ void encodeLoop(android_app* app, const std::string& target, int q0, int qMin, i
   std::string host;
   uint16_t port = 0;
   if (!mlvc::splitHostPort(target, host, port)) { LOGE("bad target %s", target.c_str()); return; }
-  const int fd = mlvc::tcpConnect(host, port);
-  if (fd < 0) { LOGE("connect %s failed", target.c_str()); return; }
-  LOGI("streaming to %s", target.c_str());
+  SRTSOCKET srt = SRT_INVALID_SOCK;
+  int fd = -1;
+  if (useSrt) {
+    mlvc::srtStartup();
+    srt = mlvc::srtConnect(host, port, srtLatencyMs);
+    if (srt == SRT_INVALID_SOCK) { LOGE("srt connect %s failed", target.c_str()); return; }
+    LOGI("streaming to %s over SRT (latency %d ms)", target.c_str(), srtLatencyMs);
+  } else {
+    fd = mlvc::tcpConnect(host, port);
+    if (fd < 0) { LOGE("connect %s failed", target.c_str()); return; }
+    LOGI("streaming to %s", target.c_str());
+  }
 
   mlvc::ModelDims dims;
   const size_t hw = static_cast<size_t>(kWidth) * kHeight;
@@ -291,19 +302,43 @@ void encodeLoop(android_app* app, const std::string& target, int q0, int qMin, i
   std::vector<void*> in2(io2.inputs.size());
   std::vector<void*> out2 = {xHat.data()};
 
-  auto wrU32 = [&](uint32_t v) { return mlvc::sendAll(fd, &v, 4); };
-  wrU32(0x424C564Du);
-  wrU32(2);
-  wrU32(kWidth);
-  wrU32(kHeight);
-  wrU32(static_cast<uint32_t>(q0));
-  wrU32(0);  // frames=0: live stream, until socket closes
+  // Container v4 on both transports, byte-identical to mlvc_encode's wire
+  // format (header: magic,version,w,h,q,frames; per frame: size, qFrame,
+  // curIdx, sender-timestamp, payload). SRT gets the header as a repeated
+  // out-of-band message (srtSendHeader) so TSBPD startup loss can't kill
+  // the session; per-frame data is accumulated and sent as chunked messages.
+  std::vector<uint8_t> srtBuf;
+  uint32_t srtFrameIdx = 0;
+  bool sendOk = true;
+  auto sendBytes = [&](const void* p, size_t n) {
+    if (srt != SRT_INVALID_SOCK) {
+      const auto* b = static_cast<const uint8_t*>(p);
+      srtBuf.insert(srtBuf.end(), b, b + n);
+    } else if (!mlvc::sendAll(fd, p, n)) {
+      sendOk = false;
+    }
+  };
+  auto wrU32 = [&](uint32_t v) { sendBytes(&v, 4); };
+  auto flushFrame = [&] {
+    if (srt == SRT_INVALID_SOCK || srtBuf.empty()) return;
+    if (!mlvc::srtSendFrame(srt, srtFrameIdx++, srtBuf.data(), srtBuf.size())) sendOk = false;
+    srtBuf.clear();
+  };
+  {
+    uint32_t hdr[6] = {0x424C564Du, 4, kWidth, kHeight, static_cast<uint32_t>(q0), 0};
+    if (srt != SRT_INVALID_SOCK) {
+      mlvc::srtSendHeader(srt, hdr, sizeof(hdr));
+    } else {
+      sendBytes(hdr, sizeof(hdr));
+    }
+  }
 
   mlvc::RateController rc;
   rc.q = q0; rc.qMin = qMin; rc.qMax = qMax;
   mlvc::CoderWorkspace ws;
   ws.enc.reserve(zN + 2 * yHalfN);
   int f = 0;
+  int curIdx = 0;  // resets at every I-frame; drives qpShift and the schedule
   double statT0 = msNow(), busyMs = 0;
   size_t statBytes = 0;
 
@@ -316,17 +351,44 @@ void encodeLoop(android_app* app, const std::string& target, int q0, int qMin, i
 
     mlvc::Feedback fb{}, latest{};
     bool got = false;
-    while (mlvc::recvNonBlocking(fd, &fb, sizeof(fb))) {
-      if (fb.magic == mlvc::kFeedbackMagic) { latest = fb; got = true; }
+    if (srt != SRT_INVALID_SOCK) {
+      // Live-mode SRT hard-rejects any recv buffer smaller than
+      // SRTO_PAYLOADSIZE even for tiny messages (LiveCC checkTransArgs).
+      char fbuf[mlvc::kSrtChunkPayload];
+      int n;
+      while ((n = srt_recv(srt, fbuf, sizeof(fbuf))) >= (int)sizeof(mlvc::Feedback)) {
+        memcpy(&fb, fbuf, sizeof(fb));
+        if (fb.magic == mlvc::kFeedbackMagic) { latest = fb; got = true; }
+      }
+    } else {
+      while (mlvc::recvNonBlocking(fd, &fb, sizeof(fb))) {
+        if (fb.magic == mlvc::kFeedbackMagic) { latest = fb; got = true; }
+      }
     }
+    // I-frame recovery is unconditional; rate adaptation rides the same
+    // feedback. Same split as mlvc_encode.
+    if (got && latest.needIframe) curIdx = 0;
     if (got) {
       if (latest.verdict < 0) rc.maybeCongested(latest.waitMs);
       else if (latest.verdict > 0) rc.healthy();
       else rc.hold();
     }
+
+    // Reference refresh, identical schedule to mlvc_encode and the decoder.
+    if (mlvc::isIframe(curIdx)) {
+      curIdx = 0;
+      std::fill(refFrame.begin(), refFrame.end(), 0x3800);  // fp16 0.5 gray
+      std::fill(refFeature.begin(), refFeature.end(), 0);
+      refExists = 0;
+    } else if (mlvc::isFeatureReset(curIdx)) {
+      std::fill(refFeature.begin(), refFeature.end(), 0);
+      refExists = 0;
+    } else {
+      refExists = 0x3C00;  // fp16 1.0
+    }
+
     const int qFrame = rc.q;
-    qShifted = qFrame + mlvc::qpShift(f);
-    refExists = (f == 0) ? 0 : 0x3C00;
+    qShifted = qFrame + mlvc::qpShift(curIdx);
 
     in1[orderOf(io1, "x")] = x.data();
     in1[orderOf(io1, "ref_frame")] = refFrame.data();
@@ -347,20 +409,28 @@ void encodeLoop(android_app* app, const std::string& target, int q0, int qMin, i
     if (!ok2) { LOGE("enc2: %s", enc2.error().c_str()); break; }
 
     const double tSend0 = msNow();
-    if (!wrU32(static_cast<uint32_t>(payload.size())) ||
-        !wrU32(static_cast<uint32_t>(qFrame)) ||
-        !mlvc::sendAll(fd, payload.data(), payload.size())) {
+    wrU32(static_cast<uint32_t>(payload.size()));
+    wrU32(static_cast<uint32_t>(qFrame));
+    wrU32(static_cast<uint32_t>(curIdx));  // v4: transmitted schedule index
+    const uint64_t tsMs = static_cast<uint64_t>(msNow());
+    sendBytes(&tsMs, sizeof(tsMs));
+    sendBytes(payload.data(), payload.size());
+    flushFrame();
+    if (!sendOk) {
       LOGI("receiver closed, stopping");
       break;
     }
     const double sendMs = msNow() - tSend0;
-    if (sendMs > 33.0) rc.congested(static_cast<uint32_t>(sendMs));
+    // TCP-only local congestion signal: a blocking send() means the socket
+    // buffer is full. SRT never blocks here (TLPKTDROP drops instead).
+    if (fd >= 0 && sendMs > 33.0) rc.congested(static_cast<uint32_t>(sendMs));
     rc.tick();
 
     refFeature.swap(feature);
     refFrame.swap(xHat);
     out1[0] = feature.data();
     out2[0] = xHat.data();
+    ++curIdx;
 
     statBytes += payload.size();
     busyMs += msNow() - t0;
@@ -374,10 +444,16 @@ void encodeLoop(android_app* app, const std::string& target, int q0, int qMin, i
       statBytes = 0;
     }
   }
-  shutdown(fd, SHUT_WR);
-  char drain[256];
-  while (recv(fd, drain, sizeof(drain), 0) > 0) {}
-  close(fd);
+  if (srt != SRT_INVALID_SOCK) {
+    mlvc::srtDrainSend(srt);  // closing early discards the in-flight tail
+    srt_close(srt);
+    mlvc::srtCleanup();
+  } else {
+    shutdown(fd, SHUT_WR);
+    char drain[256];
+    while (recv(fd, drain, sizeof(drain), 0) > 0) {}
+    close(fd);
+  }
   LOGI("encode loop ended after %d frames", f);
 }
 
@@ -394,6 +470,9 @@ void android_main(android_app* app) {
   const int q0 = qs.empty() ? 63 : atoi(qs.c_str());
   const int qMin = qmins.empty() ? 21 : atoi(qmins.c_str());
   const int qMax = qmaxs.empty() ? 63 : atoi(qmaxs.c_str());
+  const bool useSrt = intentExtra(app, env, "srt") == "1";
+  const std::string srtLatS = intentExtra(app, env, "srt_latency");
+  const int srtLatencyMs = srtLatS.empty() ? 200 : atoi(srtLatS.c_str());
   if (target.empty() && intentExtra(app, env, "mode") != "bridge") {
     LOGE("no -e target given; exiting");
     ANativeActivity_finish(app->activity);
@@ -528,7 +607,8 @@ void android_main(android_app* app) {
       const std::string dumpPath = std::string(app->activity->internalDataPath) + "/dump.i420";
       bridgeLoop(bridgePort, dumpPath);
     } else {
-      encodeLoop(app, target, q0, qMin, qMax, enc1Path, enc2Path, pmfPath, backendLib);
+      encodeLoop(app, target, q0, qMin, qMax, enc1Path, enc2Path, pmfPath, backendLib,
+                 useSrt, srtLatencyMs);
     }
   });
 

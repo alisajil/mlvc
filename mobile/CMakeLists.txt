@@ -51,9 +51,11 @@ if(ANDROID)
     src/qnn_runner.cpp
     src/mlvc_codec.cpp
     src/rans.cpp
+    src/srt_transport.cpp
   )
-  target_include_directories(mlvccam PRIVATE ${QAIRT_INCLUDE})
-  target_link_libraries(mlvccam native_app_glue android log camera2ndk mediandk dl)
+  target_include_directories(mlvccam PRIVATE ${QAIRT_INCLUDE} ${SRT_ANDROID}/include)
+  target_link_libraries(mlvccam ${SRT_ANDROID}/lib/libsrt.a
+                        native_app_glue android log camera2ndk mediandk dl)
   target_compile_options(mlvccam PRIVATE -O2 -Wall)
   # native_app_glue's ANativeActivity_onCreate must stay exported.
   set_target_properties(mlvccam PROPERTIES LINK_FLAGS "-u ANativeActivity_onCreate")
