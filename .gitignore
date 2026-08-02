@@ -34,3 +34,4 @@ venv/
 .env
 /mobile/*.log
 /video/conversion/_full_model/model_configs.yaml
+/demo_asset/

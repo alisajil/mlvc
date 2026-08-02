@@ -32,6 +32,13 @@ foreach(tgt mlvc_bench mlvc_encode)
   target_compile_options(${tgt} PRIVATE -O2 -Wall)
 endforeach()
 
+# Records raw camera-bridge frames to a file - no NPU/QAIRT dependency, just
+# net_util.h's TCP helpers. Used to capture a natural-content clip for
+# quality comparisons (the synthetic torture clips are a known worst case
+# for a temporally-tuned codec, see PLAN.md).
+add_executable(yuv_recorder src/yuv_recorder.cpp)
+target_compile_options(yuv_recorder PRIVATE -O2 -Wall)
+
 # Camera app: NativeActivity shared lib packaged into an APK by build_apk.sh.
 if(ANDROID)
   add_library(native_app_glue STATIC
