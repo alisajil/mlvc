@@ -210,6 +210,16 @@ int main(int argc, char** argv) {
       }
       printf("streaming to %s over SRT (latency budget %d ms)\n",
              streamTarget.c_str(), srtLatencyMs);
+      // ponytail: fixed settle delay, adaptive TSBPD-ready signal if this
+      // proves flaky on other links. On a real (~150-300ms one-way) cellular
+      // path, the receiver's TSBPD clock is calibrated from the handshake's
+      // RTT estimate and visibly under-corrects for the first few hundred ms
+      // - measured: the first 3-12 chunked messages (which include the
+      // container header, bundled with frame 0, with no redundancy) get
+      // silently TLPKTDROP'd before that settles, killing the whole session
+      // with no way to recover (unlike ordinary mid-stream frame loss, which
+      // the needIframe/curIdx-resync loop below is built to survive).
+      usleep(500 * 1000);
     } else
     out.fd = mlvc::tcpConnect(host, port);
     if (!useSrt && out.fd < 0) {
@@ -219,7 +229,7 @@ int main(int argc, char** argv) {
     }
     printf("streaming to %s\n", streamTarget.c_str());
   }
-  out.u32(0x424C564Du); out.u32(3);  // v3: per-frame q_index + send timestamp
+  out.u32(0x424C564Du); out.u32(4);  // v4: v3 + per-frame schedule index
   out.u32(static_cast<uint32_t>(width)); out.u32(static_cast<uint32_t>(height));
   out.u32(static_cast<uint32_t>(qIndex));
   out.u32(liveInput ? 0u : static_cast<uint32_t>(frames));
@@ -294,12 +304,22 @@ int main(int argc, char** argv) {
   for (int f = 0; (liveInput ? !liveEnded : f < frames); ++f) {
     const double t0 = msNow();
     // Drain any feedback that arrived since the last frame; act on the newest.
-    if (adaptive && out.fd >= 0) {
+    // Unconditional: I-frame recovery must work without --adaptive, and the
+    // old `out.fd >= 0` gate made the SRT branch unreachable (fd is -1 there).
+    if (out.srt != SRT_INVALID_SOCK || out.fd >= 0) {
       mlvc::Feedback fb{}, latest{};
       bool got = false;
       if (out.srt != SRT_INVALID_SOCK) {
-        char fbuf[sizeof(mlvc::Feedback)];
-        while (srt_recv(out.srt, fbuf, sizeof(fbuf)) == (int)sizeof(fbuf)) {
+        // Live-mode SRT rejects any recv buffer smaller than SRTO_PAYLOADSIZE
+        // (checkTransArgs in congctl.cpp: "buffer size: N is too small for
+        // the maximum possible 1300") - it doesn't just warn, every call
+        // fails, which was silently corrupting this socket's congestion
+        // state until it dropped a few dozen frames later. The Feedback
+        // struct itself is ~20 bytes; the buffer must still be sized to the
+        // channel's payload limit regardless of the actual message size.
+        char fbuf[mlvc::kSrtChunkPayload];
+        int n;
+        while ((n = srt_recv(out.srt, fbuf, sizeof(fbuf))) >= (int)sizeof(mlvc::Feedback)) {
           memcpy(&fb, fbuf, sizeof(fb));
           if (fb.magic == mlvc::kFeedbackMagic) { latest = fb; got = true; }
         }
@@ -314,7 +334,7 @@ int main(int argc, char** argv) {
         curIdx = 0;
         ++iframesForced;
       }
-      if (got) {
+      if (got && adaptive) {
         const int before = rc.q;
         if (latest.verdict < 0) rc.maybeCongested(latest.waitMs);
         else if (latest.verdict > 0) rc.healthy();
@@ -405,6 +425,11 @@ int main(int argc, char** argv) {
     const double tSend0 = msNow();
     out.u32(static_cast<uint32_t>(payload.size()));
     out.u32(static_cast<uint32_t>(qFrame));
+    // v4: transmit the schedule index instead of relying on the decoder
+    // mirroring it by counting frames. Counting desyncs the moment a frame is
+    // lost in flight or an I-frame is forced out of schedule - the decoder
+    // then applies the wrong qpShift row and decodes garbage with no error.
+    out.u32(static_cast<uint32_t>(curIdx));
     // Sender clock. The two machines are not synchronised, so only the SPREAD
     // of (arrival - send) is meaningful - that spread is exactly the queueing
     // delay this guard exists to bound.
@@ -459,6 +484,7 @@ int main(int argc, char** argv) {
          tPre.avg(), tPre.mx, tNpu1.avg(), tNpu1.mx, tNpu2.avg(), tNpu2.mx,
          tRans.avg(), tRans.mx, tTotal.avg(), tTotal.mx);
   if (out.srt != SRT_INVALID_SOCK) {
+    mlvc::srtDrainSend(out.srt);  // closing early discards the in-flight tail
     srt_close(out.srt);
     mlvc::srtCleanup();
     printf("srt closed\n");

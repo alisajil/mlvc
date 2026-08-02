@@ -3,8 +3,11 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <unistd.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace mlvc {
 namespace {
@@ -49,17 +52,17 @@ SRTSOCKET srtConnect(const std::string& host, uint16_t port, int latencyMs) {
   srtConfigureLive(s, latencyMs);
   const int conntimeo = 8000;  // cellular handshakes are slow; default 3s is tight
   srt_setsockflag(s, SRTO_CONNTIMEO, &conntimeo, sizeof(conntimeo));
-  // srt_create_socket() with no hint appears to default the underlying UDP
-  // socket to AF_INET: connecting it straight to an IPv6 destination produced
-  // zero packets on the wire and a silent timeout (confirmed with a packet
-  // capture and SRT's own debug log - not one handshake attempt logged).
-  // Binding an IPv6 ANY address first forces the real socket to be IPv6.
-  // NOTE (2026-08-02): connect over real cellular IPv6 times out with ZERO
-  // packets on the wire (confirmed via tcpdump) despite raw UDP to the same
-  // address working (confirmed with a plain nc round-trip). An explicit
-  // pre-bind to force the IPv6 family was tried and rejected outright by SRT
-  // (srt_bind -> "Operation not supported"), disproving that theory. Root
-  // cause not yet found - see PLAN.md.
+  // The sender polls this socket for receiver feedback (needIframe) between
+  // frames; a blocking recv would stall the encode loop. Must be set BEFORE
+  // connect - setting it after produced a "LiveCC buffer size: 20 is too
+  // small" warning and a disconnect a few frames later (some options only
+  // take effect cleanly pre-handshake).
+  const bool blocking = false;
+  srt_setsockflag(s, SRTO_RCVSYN, &blocking, sizeof(blocking));
+  // If this times out with no packets apparently arriving: the caller side
+  // sends fine (verified by syscall trace on Android). The historical failure
+  // was the LISTENER replying from a different source address than the one
+  // dialed (multi-address IPv6 host, wildcard bind) - see srtAcceptOne.
   if (srt_connect(s, reinterpret_cast<sockaddr*>(&addr), addrLen) == SRT_ERROR) {
     fprintf(stderr, "srt_connect: %s\n", srt_getlasterror_str());
     srt_close(s);
@@ -68,13 +71,20 @@ SRTSOCKET srtConnect(const std::string& host, uint16_t port, int latencyMs) {
   return s;
 }
 
-SRTSOCKET srtAcceptOne(uint16_t port, int latencyMs) {
+SRTSOCKET srtAcceptOne(uint16_t port, int latencyMs,
+                       const std::string& bindAddr) {
   const SRTSOCKET srv = srt_create_socket();
   if (srv == SRT_INVALID_SOCK) return SRT_INVALID_SOCK;
   srtConfigureLive(srv, latencyMs);
   sockaddr_in6 a6{};
   a6.sin6_family = AF_INET6;
   a6.sin6_addr = in6addr_any;
+  if (!bindAddr.empty() &&
+      inet_pton(AF_INET6, bindAddr.c_str(), &a6.sin6_addr) != 1) {
+    fprintf(stderr, "srtAcceptOne: bad bind address '%s'\n", bindAddr.c_str());
+    srt_close(srv);
+    return SRT_INVALID_SOCK;
+  }
   a6.sin6_port = htons(port);
   const int v6only = 1;  // IPv6 only: the sole path that works phone->Mac here
   srt_setsockflag(srv, SRTO_IPV6ONLY, &v6only, sizeof(v6only));
@@ -89,12 +99,38 @@ SRTSOCKET srtAcceptOne(uint16_t port, int latencyMs) {
   return s;
 }
 
+namespace {
+
+// ponytail: test hook, env-parsed once. MLVC_SRT_DROP=comma list of frame
+// indices to send incomplete (chunk 0 withheld); MLVC_SRT_DROP_FULL=frames to
+// withhold entirely. Simulates TLPKTDROP loss deterministically.
+bool inDropList(const char* env, uint32_t frameIdx) {
+  const char* v = getenv(env);
+  if (!v) return false;
+  for (const char* p = v; *p;) {
+    char* end = nullptr;
+    if (strtoul(p, &end, 10) == frameIdx) return true;
+    if (!end || *end == '\0') break;
+    p = end + 1;
+  }
+  return false;
+}
+
+}  // namespace
+
 bool srtSendFrame(SRTSOCKET s, uint32_t frameIdx, const void* data, size_t n) {
   const auto* p = static_cast<const uint8_t*>(data);
   const size_t body = kSrtChunkPayload - sizeof(SrtChunkHeader);
   const uint16_t count = static_cast<uint16_t>((n + body - 1) / body);
+  const bool dropFull = inDropList("MLVC_SRT_DROP_FULL", frameIdx);
+  const bool dropOne = !dropFull && inDropList("MLVC_SRT_DROP", frameIdx);
+  if (dropFull || dropOne)
+    fprintf(stderr, "TEST: dropping %s of frame %u\n",
+            dropFull ? "all chunks" : "chunk 0", frameIdx);
+  if (dropFull) return true;
   std::vector<uint8_t> buf(kSrtChunkPayload);
   for (uint16_t i = 0; i < count; ++i) {
+    if (dropOne && i == 0) continue;
     const size_t off = static_cast<size_t>(i) * body;
     const size_t len = std::min(body, n - off);
     SrtChunkHeader h{frameIdx, i, count, static_cast<uint32_t>(n)};
@@ -109,6 +145,14 @@ bool srtSendFrame(SRTSOCKET s, uint32_t frameIdx, const void* data, size_t n) {
     }
   }
   return true;
+}
+
+void srtDrainSend(SRTSOCKET s, int maxWaitMs) {
+  for (int waited = 0; waited < maxWaitMs; waited += 10) {
+    size_t blocks = 0, bytes = 0;
+    if (srt_getsndbuffer(s, &blocks, &bytes) == SRT_ERROR || bytes == 0) return;
+    usleep(10000);
+  }
 }
 
 bool srtRecvFrame(SRTSOCKET s, std::vector<uint8_t>& out, uint32_t& frameIdx,
@@ -128,10 +172,18 @@ bool srtRecvFrame(SRTSOCKET s, std::vector<uint8_t>& out, uint32_t& frameIdx,
       if (err == SRT_ECONNLOST || err == SRT_EINVSOCK) return false;
       continue;
     }
-    if (n < static_cast<int>(sizeof(SrtChunkHeader))) continue;
+    if (n < static_cast<int>(sizeof(SrtChunkHeader))) {
+      if (getenv("MLVC_SRT_TRACE"))
+        fprintf(stderr, "[srtRecvFrame] runt message n=%d (< header %zu)\n", n,
+                sizeof(SrtChunkHeader));
+      continue;
+    }
     SrtChunkHeader h{};
     memcpy(&h, buf, sizeof(h));
     const size_t body = kSrtChunkPayload - sizeof(SrtChunkHeader);
+    if (getenv("MLVC_SRT_TRACE"))
+      fprintf(stderr, "[srtRecvFrame] n=%d frameIdx=%u chunkIdx=%u/%u frameBytes=%u\n",
+              n, h.frameIdx, h.chunkIdx, h.chunkCount, h.frameBytes);
 
     if (h.frameIdx != curFrame) {
       // Moving on with an incomplete frame means SRT abandoned chunks for it.

@@ -57,11 +57,26 @@ inline void srtConfigureLive(SRTSOCKET s, int latencyMs) {
 SRTSOCKET srtConnect(const std::string& host, uint16_t port, int latencyMs);
 
 // Listener side; blocks until one caller connects.
-SRTSOCKET srtAcceptOne(uint16_t port, int latencyMs);
+//
+// `bindAddr` should be the exact IPv6 address callers dial (empty = any).
+// Binding the specific address matters on a multi-address host: with a
+// wildcard bind the OS picks the reply source address by its own preference
+// (macOS prefers the rotating RFC 4941 temporary address), and when that
+// differs from the address the caller targeted, the caller discards the
+// handshake response and times out. Binding pins the source. This was the
+// entire "SRT never connects over cellular" failure.
+SRTSOCKET srtAcceptOne(uint16_t port, int latencyMs,
+                       const std::string& bindAddr = "");
 
 // Sends one frame as chunked messages. Returns false only on a dead socket -
 // individual dropped chunks are SRT's business, not an error here.
 bool srtSendFrame(SRTSOCKET s, uint32_t frameIdx, const void* data, size_t n);
+
+// Waits (up to maxWaitMs) for the send buffer to drain before closing.
+// srt_close discards whatever is still in flight, which in live mode is a full
+// latency budget of frames - measured: exactly 6 tail frames (200 ms at 30fps)
+// lost on every clean shutdown without this.
+void srtDrainSend(SRTSOCKET s, int maxWaitMs = 2000);
 
 // Receives chunks until one frame is complete. Sets `lost` when chunks for a
 // frame went missing (that frame is undecodable and the caller must recover).

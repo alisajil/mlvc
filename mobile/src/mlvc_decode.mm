@@ -33,6 +33,7 @@ struct Source {
   std::vector<uint8_t> msg;   // current reassembled frame
   size_t msgPos = 0;
   bool frameLost = false;     // set when SRT abandoned chunks of a frame
+  uint32_t nextIdx = 0;       // expected sender frame index (gap = full loss)
   std::ifstream file;
   int fd = -1;
   bool ok = true;
@@ -45,6 +46,10 @@ struct Source {
         if (!mlvc::srtRecvFrame(srt, next, idx, lost)) return ok = false;
         if (lost) frameLost = true;
         if (next.empty()) continue;       // gap report, no payload
+        // A frame whose chunks ALL missed the latency budget arrives as no
+        // chunks at all - only the index jump reveals it.
+        if (idx != nextIdx) frameLost = true;
+        nextIdx = idx + 1;
         msg = std::move(next);
         msgPos = 0;
       }
@@ -90,7 +95,7 @@ int main(int argc, char** argv) {
   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
   setvbuf(stdout, nullptr, _IOLBF, 0);  // line-buffered: a live tool must
                                         // report progress as it happens
-  std::string bsPath, modelPath, pmfPath, refPath, outPath;
+  std::string bsPath, modelPath, pmfPath, refPath, outPath, bindAddr;
   int listenPort = 0;
   bool computeAll = false;
   bool bindAll = false;
@@ -111,6 +116,7 @@ int main(int argc, char** argv) {
     else if (a == "--verbose") verbose = true;
     else if (a == "--srt") useSrt = true;
     else if (a == "--srt-latency") srtLatencyMs = atoi(next());
+    else if (a == "--bind") bindAddr = next();
     else { fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
   }
   if ((bsPath.empty() && listenPort == 0) || modelPath.empty() || pmfPath.empty()) {
@@ -121,27 +127,37 @@ int main(int argc, char** argv) {
   // --- container header ---
   Source bs;
   if (listenPort > 0) {
-    printf("listening on %s:%d ...\n", bindAll ? "0.0.0.0" : "127.0.0.1", listenPort);
-    fflush(stdout);
+    // stdout is reserved for raw pixel bytes when --out /dev/stdout pipes
+    // into a player (ffplay etc) - all status/diagnostic text must go to
+    // stderr, or it lands in the pixel stream and corrupts every frame.
+    fprintf(stderr, "listening on %s:%d ...\n", bindAll ? "0.0.0.0" : "127.0.0.1", listenPort);
     if (useSrt) {
       mlvc::srtStartup();
-      printf("SRT listening on :%d (latency budget %d ms)\n", listenPort, srtLatencyMs);
-      fflush(stdout);
-      bs.srt = mlvc::srtAcceptOne((uint16_t)listenPort, srtLatencyMs);
+      // Bind the exact address callers dial: a wildcard bind on a
+      // multi-address host replies from the OS-preferred source address and
+      // the caller drops the mismatched handshake (see srtAcceptOne).
+      fprintf(stderr, "SRT listening on [%s]:%d (latency budget %d ms)\n",
+             bindAddr.empty() ? "::" : bindAddr.c_str(), listenPort, srtLatencyMs);
+      bs.srt = mlvc::srtAcceptOne((uint16_t)listenPort, srtLatencyMs, bindAddr);
       if (bs.srt == SRT_INVALID_SOCK) { fprintf(stderr, "srt listen failed\n"); return 1; }
     } else {
       bs.fd = mlvc::tcpAcceptOne((uint16_t)listenPort, bindAll);
       if (bs.fd < 0) { fprintf(stderr, "listen failed\n"); return 1; }
     }
-    printf("sender connected\n");
+    fprintf(stderr, "sender connected\n");
   } else {
     bs.file.open(bsPath, std::ios::binary);
     if (!bs.file) { fprintf(stderr, "cannot open %s\n", bsPath.c_str()); return 1; }
   }
   auto rdU32 = [&]() { return bs.u32(); };
-  if (rdU32() != 0x424C564Du) { fprintf(stderr, "bad magic\n"); return 1; }
+  const uint32_t gotMagic = rdU32();
+  if (gotMagic != 0x424C564Du) {
+    fprintf(stderr, "bad magic: got 0x%08x (msg.size=%zu msgPos=%zu nextIdx=%u)\n",
+            gotMagic, bs.msg.size(), bs.msgPos, bs.nextIdx);
+    return 1;
+  }
   const uint32_t version = rdU32();
-  if (version != 1 && version != 2 && version != 3) {
+  if (version < 1 || version > 4) {
     fprintf(stderr, "unsupported container version %u\n", version);
     return 1;
   }
@@ -156,7 +172,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   const bool live = frames == 0;  // v2 live stream: run until the sender closes
-  printf("bitstream: %dx%d q=%d frames=%s\n", width, height, qIndex,
+  fprintf(stderr, "bitstream: %dx%d q=%d frames=%s\n", width, height, qIndex,
          live ? "live" : std::to_string(frames).c_str());
 
   mlvc::ModelDims dims;
@@ -187,7 +203,7 @@ int main(int argc, char** argv) {
       }
       NSURL* cachedUrl = [NSURL fileURLWithPath:cached];
       modelUrl = [fm moveItemAtURL:compiledUrl toURL:cachedUrl error:nil] ? cachedUrl : compiledUrl;
-      printf("compiled -> %s\n", modelUrl.path.UTF8String);
+      fprintf(stderr, "compiled -> %s\n", modelUrl.path.UTF8String);
     }
   }
   MLModelConfiguration* cfg = [[MLModelConfiguration alloc] init];
@@ -255,8 +271,13 @@ int main(int argc, char** argv) {
   for (int f = 0; live || f < frames; ++f) {
     const double tWait0 = msNow();
     const uint32_t sz = rdU32();
-    if (live && !bs.ok) { printf("stream ended by sender\n"); break; }
-    if (!bs.ok || sz < 8 || sz > (1u << 22)) {  // 4 MB ceiling; 720p frames are ~7 KB
+    if (!bs.ok) {
+      // Frames lost in flight never arrive, so a finite stream can end short.
+      fprintf(stderr, "stream ended by sender (%d of %s frames)\n", f,
+             live ? "live" : std::to_string(frames).c_str());
+      break;
+    }
+    if (sz < 8 || sz > (1u << 22)) {  // 4 MB ceiling; 720p frames are ~7 KB
       fprintf(stderr, "rejected frame %d payload size %u\n", f, sz);
       return 1;
     }
@@ -268,6 +289,17 @@ int main(int argc, char** argv) {
         fprintf(stderr, "rejected frame %d q_index %d\n", f, qFrame);
         return 1;
       }
+    }
+    // v4: the encoder transmits its schedule index instead of the decoder
+    // counting frames to derive it. Counting silently desyncs the two ends
+    // the moment any frame is lost or an out-of-schedule I-frame is forced -
+    // the decoder would then apply the wrong qpShift row to a structurally
+    // fine bitstream and produce silently corrupt (not rejected) output.
+    // Wire order (mlvc_encode.cpp): size, qFrame, curIdx, timestamp, payload -
+    // curIdx MUST be read before the timestamp, not after.
+    if (version >= 4) {
+      curIdx = (int)rdU32();
+      if (!bs.ok) { fprintf(stderr, "truncated at frame %d\n", f); return 1; }
     }
     uint64_t sendTsMs = 0;
     if (version >= 3) bs.read(&sendTsMs, sizeof(sendTsMs));
@@ -392,7 +424,7 @@ int main(int argc, char** argv) {
       outYuv.write((char*)o.data(), (std::streamsize)o.size());
     }
     if (verbose) {
-      printf("  frame %3d q=%2d %6u B wait=%6.1f ms decode=%5.1f ms\n", f, qFrame, sz,
+      fprintf(stderr, "  frame %3d q=%2d %6u B wait=%6.1f ms decode=%5.1f ms\n", f, qFrame, sz,
              t0 - tWait0, t2 - t1);
     }
     ++curIdx;
@@ -402,23 +434,23 @@ int main(int argc, char** argv) {
   }
   const int statFrames = decoded > 0 ? decoded : 1;
 
-  printf("decoded %d frames\n", decoded);
-  printf("decode ms/frame: rans=%.2f coreml=%.2f total=%.2f (%.1f fps)\n",
+  fprintf(stderr, "decoded %d frames\n", decoded);
+  fprintf(stderr, "decode ms/frame: rans=%.2f coreml=%.2f total=%.2f (%.1f fps)\n",
          sumRans / statFrames, sumNpu / statFrames, (sumRans + sumNpu) / statFrames,
          1000.0 / ((sumRans + sumNpu) / statFrames));
-  if (havePsnr) printf("PSNR (6:1:1): mean=%.2f dB min=%.2f dB\n", sumPsnr / statFrames, psnrMin);
+  if (havePsnr) fprintf(stderr, "PSNR (6:1:1): mean=%.2f dB min=%.2f dB\n", sumPsnr / statFrames, psnrMin);
   if (bs.fd >= 0) {
-    printf("live: wait-for-frame=%.2f ms avg | inter-frame gap avg=%.2f ms max=%.2f ms "
+    fprintf(stderr, "live: wait-for-frame=%.2f ms avg | inter-frame gap avg=%.2f ms max=%.2f ms "
            "(%.1f fps sustained)\n",
            sumWait / statFrames, sumGap / std::max(1, statFrames - 1), maxGap,
            1000.0 / (sumGap / std::max(1, statFrames - 1)));
     if (version >= 3 && decoded > 0) {
-      printf("latency: queueing delay above best case: avg=%.0f ms peak=%.0f ms "
+      fprintf(stderr, "latency: queueing delay above best case: avg=%.0f ms peak=%.0f ms "
              "(clock offset removed)\n",
              sumDelta / statFrames - minDelta, maxDelta - minDelta);
     }
-    if (lostFrames) printf("loss: %d frames incomplete, I-frame recovery requested\n", lostFrames);
-    printf("adaptive: q ranged %d..%d (mean %.1f) | %d/%d frames starved\n",
+    if (lostFrames) fprintf(stderr, "loss: %d frames incomplete, I-frame recovery requested\n", lostFrames);
+    fprintf(stderr, "adaptive: q ranged %d..%d (mean %.1f) | %d/%d frames starved\n",
            qMinSeen, qMaxSeen, (double)qSum / statFrames, starvedFrames, decoded);
   }
   return 0;
