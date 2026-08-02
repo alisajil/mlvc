@@ -167,7 +167,17 @@ bool QnnRunner::init(const std::string& backendPath, const std::string& systemPa
     impl_->device = nullptr;
   }
 
-  // --- burst perf mode (best-effort; benchmark parity with qnn-net-run) ---
+  // --- sustained perf mode (was: pinned-max "burst", benchmark parity with
+  // qnn-net-run - appropriate for a one-shot profiling run, wrong for a live
+  // stream that has to run for minutes: pinning both voltage corners to MAX
+  // and disabling DSP sleep between calls kept the chip at peak draw
+  // continuously, even during the ~10ms/frame idle gap our real workload
+  // has (measured total ~20ms of a 33ms budget). POWER_SAVER_MODE lets DCVS
+  // actually scale down when idle and ramp up under real load, instead of
+  // sitting pinned high regardless of demand - same correctness, same frame
+  // budget headroom, far less sustained heat. ponytail: TURBO ceiling chosen
+  // for headroom over our measured ~20ms/frame; lower it further if thermal
+  // margin needs to grow, raise it if a heavier model needs the ceiling.
   if (burstMode && impl_->fn.deviceGetInfrastructure) {
     QnnDevice_Infrastructure_t devInfra = nullptr;
     if (impl_->fn.deviceGetInfrastructure(&devInfra) == QNN_SUCCESS && devInfra) {
@@ -180,21 +190,21 @@ bool QnnRunner::init(const std::string& backendPath, const std::string& systemPa
           dcvs.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3;
           dcvs.dcvsV3Config.contextId = impl_->powerConfigId;
           dcvs.dcvsV3Config.setDcvsEnable = 1;
-          dcvs.dcvsV3Config.dcvsEnable = 0;  // pin clocks, no scaling
+          dcvs.dcvsV3Config.dcvsEnable = 1;  // let clocks scale with real load
           dcvs.dcvsV3Config.powerMode =
-              QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
+              QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_POWER_SAVER_MODE;
           dcvs.dcvsV3Config.setSleepLatency = 1;
           dcvs.dcvsV3Config.sleepLatency = 40;
           dcvs.dcvsV3Config.setSleepDisable = 1;
-          dcvs.dcvsV3Config.sleepDisable = 1;
+          dcvs.dcvsV3Config.sleepDisable = 0;  // allow DSP sleep in the idle gap each frame
           dcvs.dcvsV3Config.setBusParams = 1;
-          dcvs.dcvsV3Config.busVoltageCornerMin = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
-          dcvs.dcvsV3Config.busVoltageCornerTarget = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
-          dcvs.dcvsV3Config.busVoltageCornerMax = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
+          dcvs.dcvsV3Config.busVoltageCornerMin = DCVS_VOLTAGE_VCORNER_NOM;
+          dcvs.dcvsV3Config.busVoltageCornerTarget = DCVS_VOLTAGE_VCORNER_NOM_PLUS;
+          dcvs.dcvsV3Config.busVoltageCornerMax = DCVS_VOLTAGE_VCORNER_TURBO;
           dcvs.dcvsV3Config.setCoreParams = 1;
-          dcvs.dcvsV3Config.coreVoltageCornerMin = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
-          dcvs.dcvsV3Config.coreVoltageCornerTarget = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
-          dcvs.dcvsV3Config.coreVoltageCornerMax = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
+          dcvs.dcvsV3Config.coreVoltageCornerMin = DCVS_VOLTAGE_VCORNER_NOM;
+          dcvs.dcvsV3Config.coreVoltageCornerTarget = DCVS_VOLTAGE_VCORNER_NOM_PLUS;
+          dcvs.dcvsV3Config.coreVoltageCornerMax = DCVS_VOLTAGE_VCORNER_TURBO;
           const QnnHtpPerfInfrastructure_PowerConfig_t* cfgs[] = {&dcvs, nullptr};
           if (impl_->perfInfra.setPowerConfig(impl_->powerConfigId, cfgs) ==
               QNN_SUCCESS) {
@@ -204,7 +214,7 @@ bool QnnRunner::init(const std::string& backendPath, const std::string& systemPa
       }
     }
     if (!impl_->powerConfigSet) {
-      fprintf(stderr, "warn: burst perf config not applied, running default clocks\n");
+      fprintf(stderr, "warn: sustained perf config not applied, running default clocks\n");
     }
   }
 
