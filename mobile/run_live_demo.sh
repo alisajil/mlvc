@@ -58,16 +58,33 @@ if [ -z "$MAC_ADDR" ]; then
 fi
 echo "Mac addr: $MAC_ADDR  SRT port: $SRT_PORT"
 
+# Model selection: default is the psnr checkpoint; MODEL=perceptual switches
+# both ends to the perceptual variant (phone context binaries + pmf must
+# already be pushed, Mac CoreML bundle already exported).
+MODEL="${MODEL:-psnr}"
+if [ "$MODEL" = "perceptual" ]; then
+  MAC_MODEL="/Users/sajil/genzee/mlvc/video/output/models/mlvc_s-mlvc-s-perceptual-v1/coreml-apple/1280x720/MLVCDecoder.mlpackage"
+  PHONE_ENC1="perc_720p_enc1_v75.bin"; PHONE_ENC2="perc_720p_enc2_v75.bin"
+  PHONE_PMF="pmf_tables_perceptual.bin"
+  MAC_PMF="/Users/sajil/genzee/mlvc/demo_asset/pmf_tables_perceptual.bin"
+else
+  MAC_MODEL="/Users/sajil/genzee/mlvc/video/output/models/mlvc_s-mlvc-s-psnr-v1/coreml-apple/1280x720/MLVCDecoder.mlmodelc"
+  PHONE_ENC1="s24_720p_enc1_v75.bin"; PHONE_ENC2="s24_720p_enc2_v75.bin"
+  PHONE_PMF="pmf_tables.bin"
+  MAC_PMF="$HERE/pmf_tables.bin"
+fi
+echo "model: $MODEL"
+
 DEC_LOG="$HERE/live_dec.log"
 bash -c "'$HERE/build_mac/mlvc_decode' --listen $SRT_PORT --public --srt --bind $MAC_ADDR \
-  --model '/Users/sajil/genzee/mlvc/video/output/models/mlvc_s-mlvc-s-psnr-v1/coreml-apple/1280x720/MLVCDecoder.mlmodelc' \
-  --pmf '$HERE/pmf_tables.bin' --out /dev/stdout 2>'$DEC_LOG' \
+  --model '$MAC_MODEL' \
+  --pmf '$MAC_PMF' --out /dev/stdout 2>'$DEC_LOG' \
   | ffplay -f rawvideo -pixel_format yuv420p -video_size 1280x720 -framerate 30 -" &
 DEC_PID=$!
 sleep 1
 echo "decoder: $(tail -2 "$DEC_LOG" 2>/dev/null)"
 
-adb_ shell "cd /data/local/tmp/mlvc && export LD_LIBRARY_PATH=/data/local/tmp/mlvc ADSP_LIBRARY_PATH=/data/local/tmp/mlvc && nohup ./mlvc_encode --yuv-listen 8901 --width 1280 --height 720 --frames 0 --q 63 --enc1 s24_720p_enc1_v75.bin --enc2 s24_720p_enc2_v75.bin --pmf pmf_tables.bin --srt --stream '[$MAC_ADDR]:$SRT_PORT' > /data/local/tmp/mlvc/enc_live.log 2>&1 & disown" >/dev/null 2>&1 &
+adb_ shell "cd /data/local/tmp/mlvc && export LD_LIBRARY_PATH=/data/local/tmp/mlvc ADSP_LIBRARY_PATH=/data/local/tmp/mlvc && nohup ./mlvc_encode --yuv-listen 8901 --width 1280 --height 720 --frames 0 --q 63 --enc1 $PHONE_ENC1 --enc2 $PHONE_ENC2 --pmf $PHONE_PMF --srt --stream '[$MAC_ADDR]:$SRT_PORT' > /data/local/tmp/mlvc/enc_live.log 2>&1 & disown" >/dev/null 2>&1 &
 sleep 2
 adb_ shell am start -n com.mlvc.cam/android.app.NativeActivity -e mode bridge -e camera front -e bridge_port 8901 >/dev/null
 
