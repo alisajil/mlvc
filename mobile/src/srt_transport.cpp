@@ -217,4 +217,46 @@ bool srtRecvFrame(SRTSOCKET s, std::vector<uint8_t>& out, uint32_t& frameIdx,
   }
 }
 
+bool srtSendHeader(SRTSOCKET s, const void* data, size_t n, int repeats,
+                   int gapMs) {
+  if (n > kSrtChunkPayload - sizeof(SrtChunkHeader)) return false;  // header is tiny; sanity check
+  std::vector<uint8_t> buf(sizeof(SrtChunkHeader) + n);
+  // frameIdx = UINT32_MAX: matches srtRecvFrame's own "no frame in progress"
+  // reset sentinel, so a header message can never masquerade as - or get
+  // confused with - a real frame's reassembly state. chunkCount = 0 is what
+  // actually marks this as a header rather than a frame chunk.
+  const SrtChunkHeader h{UINT32_MAX, 0, 0, static_cast<uint32_t>(n)};
+  memcpy(buf.data(), &h, sizeof(h));
+  memcpy(buf.data() + sizeof(h), data, n);
+  for (int i = 0; i < repeats; ++i) {
+    if (srt_send(s, reinterpret_cast<const char*>(buf.data()),
+                 static_cast<int>(buf.size())) == SRT_ERROR) {
+      const int err = srt_getlasterror(nullptr);
+      if (err == SRT_ECONNLOST || err == SRT_EINVSOCK || err == SRT_ECONNREJ) return false;
+    }
+    if (i + 1 < repeats) usleep(gapMs * 1000);
+  }
+  return true;
+}
+
+bool srtRecvHeader(SRTSOCKET s, std::vector<uint8_t>& out) {
+  char buf[kSrtChunkPayload + 64];
+  for (;;) {
+    const int n = srt_recv(s, buf, sizeof(buf));
+    if (n == SRT_ERROR) {
+      const int err = srt_getlasterror(nullptr);
+      if (err == SRT_ECONNLOST || err == SRT_EINVSOCK) return false;
+      continue;
+    }
+    if (n < static_cast<int>(sizeof(SrtChunkHeader))) continue;  // runt, ignore
+    SrtChunkHeader h{};
+    memcpy(&h, buf, sizeof(h));
+    if (h.chunkCount != 0) continue;  // an ordinary frame chunk, not the
+                                       // header - the main loop's own loss
+                                       // recovery will handle it from here
+    out.assign(buf + sizeof(h), buf + sizeof(h) + h.frameBytes);
+    return true;
+  }
+}
+
 }  // namespace mlvc

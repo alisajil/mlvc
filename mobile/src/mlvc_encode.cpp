@@ -210,16 +210,6 @@ int main(int argc, char** argv) {
       }
       printf("streaming to %s over SRT (latency budget %d ms)\n",
              streamTarget.c_str(), srtLatencyMs);
-      // ponytail: fixed settle delay, adaptive TSBPD-ready signal if this
-      // proves flaky on other links. On a real (~150-300ms one-way) cellular
-      // path, the receiver's TSBPD clock is calibrated from the handshake's
-      // RTT estimate and visibly under-corrects for the first few hundred ms
-      // - measured: the first 3-12 chunked messages (which include the
-      // container header, bundled with frame 0, with no redundancy) get
-      // silently TLPKTDROP'd before that settles, killing the whole session
-      // with no way to recover (unlike ordinary mid-stream frame loss, which
-      // the needIframe/curIdx-resync loop below is built to survive).
-      usleep(500 * 1000);
     } else
     out.fd = mlvc::tcpConnect(host, port);
     if (!useSrt && out.fd < 0) {
@@ -229,10 +219,26 @@ int main(int argc, char** argv) {
     }
     printf("streaming to %s\n", streamTarget.c_str());
   }
-  out.u32(0x424C564Du); out.u32(4);  // v4: v3 + per-frame schedule index
-  out.u32(static_cast<uint32_t>(width)); out.u32(static_cast<uint32_t>(height));
-  out.u32(static_cast<uint32_t>(qIndex));
-  out.u32(liveInput ? 0u : static_cast<uint32_t>(frames));
+  {
+    std::vector<uint8_t> hdr;
+    auto push32 = [&hdr](uint32_t v) {
+      const auto* p = reinterpret_cast<const uint8_t*>(&v);
+      hdr.insert(hdr.end(), p, p + 4);
+    };
+    push32(0x424C564Du); push32(4);  // v4: v3 + per-frame schedule index
+    push32(static_cast<uint32_t>(width)); push32(static_cast<uint32_t>(height));
+    push32(static_cast<uint32_t>(qIndex));
+    push32(liveInput ? 0u : static_cast<uint32_t>(frames));
+    if (out.srt != SRT_INVALID_SOCK) {
+      // Sent as its own repeated out-of-band message (see srtSendHeader) -
+      // NOT written into `out`, which would otherwise bundle it into frame
+      // 0's message and make it just as fragile to the TSBPD startup drop
+      // as a single unrepeated send would be.
+      mlvc::srtSendHeader(out.srt, hdr.data(), hdr.size());
+    } else {
+      out.write(hdr.data(), hdr.size());
+    }
+  }
 
   mlvc::RateController rc;
   rc.q = qIndex; rc.qMin = qMin; rc.qMax = qMax;

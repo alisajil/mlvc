@@ -84,4 +84,24 @@ void srtDrainSend(SRTSOCKET s, int maxWaitMs = 2000);
 bool srtRecvFrame(SRTSOCKET s, std::vector<uint8_t>& out, uint32_t& frameIdx,
                   bool& lost);
 
+// Sends the container header as its own out-of-band message, repeated
+// `repeats` times with `gapMs` between sends, before the caller starts
+// srtSendFrame'ing real frames. The receiver's TSBPD delivery clock is still
+// calibrating from the handshake's RTT estimate for the first few hundred ms
+// after connect and silently drops early messages (measured: the first
+// 3-12 messages on a real cellular link). The header has no redundancy and
+// is unrecoverable if lost, unlike an ordinary dropped frame - repeating it
+// turns "does the one shot survive" into "does at least one of N copies
+// survive". Marked with a reserved chunkCount=0 sentinel (real frames always
+// have chunkCount>=1) so it can never collide with the per-frame reassembly
+// path in srtRecvFrame/srtRecvHeader. `data` must fit in one chunk.
+bool srtSendHeader(SRTSOCKET s, const void* data, size_t n, int repeats = 12,
+                   int gapMs = 40);
+
+// Blocks until the header sentinel message arrives, discarding any ordinary
+// frame-chunk messages seen first (those are handled by the normal
+// loss-recovery loop once the caller starts srtRecvFrame'ing). Pairs with
+// srtSendHeader. Returns false when the connection is gone.
+bool srtRecvHeader(SRTSOCKET s, std::vector<uint8_t>& out);
+
 }  // namespace mlvc

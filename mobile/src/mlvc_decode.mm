@@ -149,21 +149,48 @@ int main(int argc, char** argv) {
     bs.file.open(bsPath, std::ios::binary);
     if (!bs.file) { fprintf(stderr, "cannot open %s\n", bsPath.c_str()); return 1; }
   }
-  auto rdU32 = [&]() { return bs.u32(); };
-  const uint32_t gotMagic = rdU32();
+  auto rdU32 = [&]() { return bs.u32(); };  // also used by the per-frame loop below
+  uint32_t gotMagic, version;
+  int width, height, qIndex, frames;
+  if (bs.srt != SRT_INVALID_SOCK) {
+    // The header arrives as its own repeated out-of-band message (see
+    // srtSendHeader/srtRecvHeader) rather than through the regular
+    // per-frame byte stream - it has no redundancy of its own otherwise,
+    // and TSBPD silently drops the first few messages after connect while
+    // its delivery clock calibrates.
+    std::vector<uint8_t> hdrBuf;
+    if (!mlvc::srtRecvHeader(bs.srt, hdrBuf) || hdrBuf.size() < 24) {
+      fprintf(stderr, "srt header receive failed\n");
+      return 1;
+    }
+    auto u32At = [&](size_t off) {
+      uint32_t v;
+      memcpy(&v, hdrBuf.data() + off, 4);
+      return v;
+    };
+    gotMagic = u32At(0);
+    version = u32At(4);
+    width = (int)u32At(8);
+    height = (int)u32At(12);
+    qIndex = (int)u32At(16);
+    frames = (int)u32At(20);
+  } else {
+    gotMagic = rdU32();
+    version = rdU32();
+    width = (int)rdU32();
+    height = (int)rdU32();
+    qIndex = (int)rdU32();
+    frames = (int)rdU32();
+    if (!bs.ok) { fprintf(stderr, "short header\n"); return 1; }
+  }
   if (gotMagic != 0x424C564Du) {
-    fprintf(stderr, "bad magic: got 0x%08x (msg.size=%zu msgPos=%zu nextIdx=%u)\n",
-            gotMagic, bs.msg.size(), bs.msgPos, bs.nextIdx);
+    fprintf(stderr, "bad magic: got 0x%08x\n", gotMagic);
     return 1;
   }
-  const uint32_t version = rdU32();
   if (version < 1 || version > 4) {
     fprintf(stderr, "unsupported container version %u\n", version);
     return 1;
   }
-  const int width = (int)rdU32(), height = (int)rdU32();
-  const int qIndex = (int)rdU32(), frames = (int)rdU32();
-  if (!bs.ok) { fprintf(stderr, "short header\n"); return 1; }
   // Untrusted input once the port is forwarded: reject anything not matching
   // the model this binary was built to decode.
   if (width != 1280 || height != 720 || qIndex < 0 || qIndex >= 72 ||
