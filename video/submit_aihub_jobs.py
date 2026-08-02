@@ -14,6 +14,13 @@ MODELS_320 = [
     ("mlvc-s-enc2-320x192", f"{BUNDLE}/320x192/MLVCEncoderPart2.onnx"),
     ("mlvc-s-dec-320x192", f"{BUNDLE}/320x192/MLVCDecoder.onnx"),
 ]
+# 1080p (padded 1920x1088; model crops back to 1080 on decode). de-risk run for
+# full-HD streaming: same 8 Gen 3/v75 chip as the working 720p demo phone.
+MODELS_1080 = [
+    ("mlvc-s-enc1-1920x1088", f"{BUNDLE}/1920x1088/MLVCEncoderPart1.onnx"),
+    ("mlvc-s-enc2-1920x1088", f"{BUNDLE}/1920x1088/MLVCEncoderPart2.onnx"),
+    ("mlvc-s-dec-1920x1088", f"{BUNDLE}/1920x1088/MLVCDecoder.onnx"),
+]
 
 PLAN = [
     # 640x368 on mid-range + ceiling
@@ -22,6 +29,8 @@ PLAN = [
     # 320x192 on mid-range + old mid-range
     (MODELS_320, hub.Device("Snapdragon 7 Gen 4 QRD")),
     (MODELS_320, hub.Device("Samsung Galaxy A73 5G")),
+    # 1080p de-risk: exact device used for the live 720p demo
+    (MODELS_1080, hub.Device("Samsung Galaxy S24 Ultra")),
 ]
 
 OPTIONS = "--target_runtime qnn_context_binary"
