@@ -48,6 +48,8 @@ if(ANDROID)
 
   add_library(mlvccam SHARED
     src/camera_app.cpp
+    src/decode_loop.cpp
+    src/android_util.cpp
     src/qnn_runner.cpp
     src/mlvc_codec.cpp
     src/rans.cpp
@@ -55,7 +57,7 @@ if(ANDROID)
   )
   target_include_directories(mlvccam PRIVATE ${QAIRT_INCLUDE} ${SRT_ANDROID}/include)
   target_link_libraries(mlvccam ${SRT_ANDROID}/lib/libsrt.a
-                        native_app_glue android log camera2ndk mediandk dl)
+                        native_app_glue android log camera2ndk mediandk dl nativewindow)
   target_compile_options(mlvccam PRIVATE -O2 -Wall)
   # native_app_glue's ANativeActivity_onCreate must stay exported.
   set_target_properties(mlvccam PROPERTIES LINK_FLAGS "-u ANativeActivity_onCreate")

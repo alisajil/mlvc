@@ -76,6 +76,28 @@ SRTSOCKET srtAcceptOne(uint16_t port, int latencyMs,
   const SRTSOCKET srv = srt_create_socket();
   if (srv == SRT_INVALID_SOCK) return SRT_INVALID_SOCK;
   srtConfigureLive(srv, latencyMs);
+
+  // A plain IPv4 literal (e.g. a local LAN address when the host has no
+  // routable IPv6 at the moment) binds a real AF_INET socket instead of the
+  // usual IPv6 path below - same-LAN phone<->Mac doesn't need IPv6 at all,
+  // that was only ever a workaround for both ends sitting behind carrier NAT.
+  in_addr v4probe{};
+  if (!bindAddr.empty() && inet_pton(AF_INET, bindAddr.c_str(), &v4probe) == 1) {
+    sockaddr_in a4{};
+    a4.sin_family = AF_INET;
+    a4.sin_addr = v4probe;
+    a4.sin_port = htons(port);
+    if (srt_bind(srv, reinterpret_cast<sockaddr*>(&a4), sizeof(a4)) == SRT_ERROR ||
+        srt_listen(srv, 1) == SRT_ERROR) {
+      fprintf(stderr, "srt bind/listen (v4): %s\n", srt_getlasterror_str());
+      srt_close(srv);
+      return SRT_INVALID_SOCK;
+    }
+    const SRTSOCKET s4 = srt_accept(srv, nullptr, nullptr);
+    srt_close(srv);
+    return s4;
+  }
+
   sockaddr_in6 a6{};
   a6.sin6_family = AF_INET6;
   a6.sin6_addr = in6addr_any;

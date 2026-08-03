@@ -9,6 +9,7 @@ aml/amlt.yaml
 *.bin
 *.png
 !assets/*.png
+!mobile/app/res/drawable-nodpi/ic_launcher.png
 *.so
 build/
 build1/

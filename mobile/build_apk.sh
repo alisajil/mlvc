@@ -24,9 +24,12 @@ cp "$QAIRT/lib/hexagon-v75/unsigned/libQnnHtpV75Skel.so" "$STAGE/lib/arm64-v8a/"
 
 cp "$HERE/../video/output/context_binaries/s24_720p_enc1_v75.bin" "$STAGE/assets/"
 cp "$HERE/../video/output/context_binaries/s24_720p_enc2_v75.bin" "$STAGE/assets/"
+cp "$HERE/../video/output/context_binaries/s24_720p_dec_v75.bin" "$STAGE/assets/"
 cp "$HERE/pmf_tables.bin" "$STAGE/assets/"
 
-"$BT/aapt2" link -o "$STAGE/base.apk" --manifest "$HERE/app/AndroidManifest.xml" -I "$PLATFORM"
+"$BT/aapt2" compile --dir "$HERE/app/res" -o "$STAGE/compiled_res.zip"
+"$BT/aapt2" link -o "$STAGE/base.apk" --manifest "$HERE/app/AndroidManifest.xml" -I "$PLATFORM" \
+  -R "$STAGE/compiled_res.zip"
 
 (cd "$STAGE" && zip -q -r base.apk lib assets)
 "$BT/zipalign" -f 4 "$STAGE/base.apk" "$STAGE/aligned.apk"

@@ -4,14 +4,15 @@
     android:versionCode="1"
     android:versionName="0.1">
 
-  <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="34" />
+  <!-- 29: ASurfaceControl/ASurfaceTransaction, used for the HUD overlay layer. -->
+  <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
 
   <uses-permission android:name="android.permission.CAMERA" />
   <uses-permission android:name="android.permission.INTERNET" />
   <uses-feature android:name="android.hardware.camera" android:required="true" />
 
-  <application android:label="MLVC Cam" android:hasCode="false"
-      android:extractNativeLibs="true">
+  <application android:label="GenZee" android:icon="@drawable/ic_launcher"
+      android:hasCode="false" android:extractNativeLibs="true">
     <!-- fastrpc client for the Hexagon NPU. A vendor public library (listed in
          /vendor/etc/public.libraries.txt), but since API 31 an app must opt in
          explicitly or the QNN stub's dlopen fails with "libcdsprpc.so not
